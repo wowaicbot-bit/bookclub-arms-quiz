@@ -101,6 +101,31 @@
   .card3 .n{font-size:12px; font-weight:800; color:var(--accent); letter-spacing:.06em}
   .card3 h4{font-size:15.5px; margin:6px 0 7px; letter-spacing:-.02em}
   .card3 p{font-size:13.5px; line-height:1.65; color:var(--muted)}
+  /* --- 방 / 실시간 투표 --- */
+  .room{display:flex; align-items:center; gap:9px; font-size:13px; color:var(--muted)}
+  .code{
+    font-weight:800; letter-spacing:.16em; color:var(--accent);
+    background:var(--accent-soft); padding:5px 11px; border-radius:8px; font-size:14px;
+  }
+  .dot{width:7px; height:7px; border-radius:99px; background:#C9C3B6; display:inline-block}
+  .dot.live{background:var(--good); box-shadow:0 0 0 3px var(--good-soft)}
+  .tally{width:100%; margin-top:2px}
+  .tallybar{height:8px; background:var(--line); border-radius:99px; overflow:hidden}
+  .tallybar i{display:block; height:100%; width:0; background:var(--accent); transition:width .4s ease}
+  .opt.right .tallybar i{background:var(--good)}
+  .tallytxt{font-size:12px; color:var(--muted); margin-top:5px; font-weight:600}
+  .opt.voted{border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft)}
+  .entry{display:flex; flex-direction:column; gap:11px; max-width:330px; margin:0 auto}
+  .entry input{
+    font:inherit; font-size:15px; text-align:center; letter-spacing:.14em; text-transform:uppercase;
+    padding:11px; border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--ink);
+  }
+  .entry .or{font-size:12.5px; color:var(--muted); margin-top:4px}
+  .hint{font-size:13px; color:var(--muted); margin-top:16px; line-height:1.6}
+  .guestmsg{
+    background:var(--card); border:1px solid var(--line); border-radius:12px;
+    padding:14px 16px; margin-top:18px; font-size:14px; color:var(--muted); text-align:center;
+  }
   @media(max-width:860px){
     .opts,.opts.trio{grid-template-columns:1fr}
     .wrap3{grid-template-columns:1fr}
@@ -113,6 +138,8 @@
 <header>
   <div class="brand">팔은 거짓말을 못 한다 <span>· 실루엣 퀴즈</span></div>
   <div class="meta">
+    <span class="room" id="room" hidden><span class="dot" id="dot"></span>
+      <span class="code" id="roomcode"></span><span id="peers"></span></span>
     <span id="count">표지</span>
     <div class="bar"><i id="prog"></i></div>
     <button class="btn" id="noteBtn">진행자 노트 N</button>
@@ -405,7 +432,17 @@ const COVER = `<div class="cover">
   <h1>팔은 거짓말을 못 한다</h1>
   <p class="sub">얼굴은 지웠습니다. 팔만 보고 여덟 번 판단해보세요.<br>
      『FBI 행동의 심리학』 · 팔 편</p>
-  <button class="btn solid" style="font-size:15px;padding:11px 26px" onclick="go(1)">시작하기</button>
+  <div class="entry">
+    <button class="btn solid" style="font-size:15px;padding:12px" onclick="hostRoom()">
+      방 만들기 · 다 같이 투표</button>
+    <div class="or">참가자는 진행자가 불러주는 코드를 넣으세요</div>
+    <input id="joincode" maxlength="6" placeholder="코드 6자리">
+    <button class="btn" onclick="joinRoom()">코드로 참가</button>
+    <div class="or">혼자 넘겨보려면</div>
+    <button class="btn" onclick="go(1)">혼자 진행</button>
+  </div>
+  <p class="hint">방을 만들면 참가자 화면이 진행자를 따라 움직이고,<br>
+     각자 고른 답이 실시간으로 집계됩니다.</p>
 </div>`;
 
 const OUTRO = `<div class="cover">
@@ -428,6 +465,109 @@ const OUTRO = `<div class="cover">
   <p class="sub" style="margin-top:26px">
     이번 주 숙제 — <b>회의실에서 내 팔이 누구 쪽으로 가 있는지</b> 한 번만 보기.</p>
 </div>`;
+
+/* ---------- 실시간 (서버 없이 공개 MQTT 브로커 경유) ---------- */
+const BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+  'wss://test.mosquitto.org:8081/mqtt',
+];
+const AB = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const rnd = n => Array.from({length:n}, ()=>AB[Math.random()*AB.length|0]).join('');
+
+let mode='solo', room=null, cli=null, me=rnd(8);
+let votes={}, peers=new Set(), myPick=null;
+
+const T = s => `bcarms/${room}/${s}`;
+
+function loadMqtt(){
+  if(window.mqtt) return Promise.resolve();
+  return new Promise((ok,no)=>{
+    const s=document.createElement('script');
+    s.src='https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js';
+    s.onload=ok; s.onerror=()=>no(new Error('mqtt load fail'));
+    document.head.appendChild(s);
+  });
+}
+
+async function connect(code, asHost){
+  await loadMqtt();
+  room = code; mode = asHost ? 'host' : 'guest';
+  document.getElementById('room').hidden = false;
+  document.getElementById('roomcode').textContent = code;
+  setDot(false);
+
+  for(const url of BROKERS){
+    try{
+      cli = await new Promise((ok,no)=>{
+        const c = mqtt.connect(url, {clientId:'bc_'+me, connectTimeout:6000, reconnectPeriod:0});
+        c.on('connect', ()=>ok(c));
+        c.on('error', e=>{ try{c.end(true)}catch{} no(e); });
+        setTimeout(()=>{ try{c.end(true)}catch{} ; no(new Error('timeout')); }, 7000);
+      });
+      break;
+    }catch(e){ cli=null; }
+  }
+  if(!cli){
+    alert('실시간 연결에 실패했습니다. 혼자 진행 모드로 넘어갑니다.');
+    mode='solo'; document.getElementById('room').hidden = true; go(1); return;
+  }
+  setDot(true);
+  cli.on('message', (t,p)=>{
+    let m; try{ m = JSON.parse(p.toString()); }catch{ return; }
+    const leaf = t.split('/').pop();
+    if(leaf==='state' && mode==='guest'){
+      i = m.i; render(); if(m.shown) reveal(true);
+    } else if(leaf==='vote'){
+      (votes[m.i] ||= {})[m.who] = m.pick;
+      peers.add(m.who); paintPeers(); paintTally();
+    } else if(leaf==='hello'){
+      peers.add(m.who); paintPeers();
+      if(mode==='host') pub('state', {i, shown});
+    }
+  });
+  cli.subscribe([T('state'), T('vote'), T('hello')]);
+
+  if(asHost){ go(1); pub('state',{i:1,shown:false}); }
+  else { pub('hello',{who:me}); }
+}
+
+function pub(ch, obj){ if(cli) cli.publish(T(ch), JSON.stringify(obj)); }
+function setDot(on){ document.getElementById('dot').classList.toggle('live', !!on); }
+function paintPeers(){
+  const n = peers.size + (mode==='host'?0:1);
+  document.getElementById('peers').textContent = n ? ` · ${n}명` : '';
+}
+
+window.hostRoom = ()=> connect(rnd(6), true);
+window.joinRoom = ()=>{
+  const v = (document.getElementById('joincode').value||'').trim().toUpperCase();
+  if(v.length!==6){ alert('코드 6자리를 넣어주세요.'); return; }
+  connect(v, false);
+};
+
+function tallyOf(qi){
+  const v = votes[qi] || {};
+  const c = {}; let t = 0;
+  for(const k in v){ c[v[k]] = (c[v[k]]||0)+1; t++; }
+  return {c, t};
+}
+function paintTally(){
+  if(mode==='solo' || i===0 || i===TOTAL-1) return;
+  const {c,t} = tallyOf(i);
+  stage.querySelectorAll('.opt').forEach((el,n)=>{
+    let box = el.querySelector('.tally');
+    if(!box){
+      box = document.createElement('div');
+      box.className='tally';
+      box.innerHTML='<div class="tallybar"><i></i></div><div class="tallytxt"></div>';
+      el.appendChild(box);
+    }
+    const k = c[n]||0;
+    box.querySelector('i').style.width = (t ? k/t*100 : 0)+'%';
+    box.querySelector('.tallytxt').textContent = t ? `${k}명 (${Math.round(k/t*100)}%)` : '아직 없음';
+  });
+}
 
 /* ---------- 구동 ---------- */
 let i = 0, shown = false, notes = false;
@@ -461,10 +601,23 @@ function render(){
     stage.querySelectorAll('.opt').forEach(el=>{
       el.onclick = ()=>{
         if(shown) return;
-        stage.querySelectorAll('.opt').forEach(x=>x.classList.remove('picked'));
-        el.classList.add('picked');
+        stage.querySelectorAll('.opt').forEach(x=>x.classList.remove('picked','voted'));
+        el.classList.add(mode==='solo' ? 'picked' : 'voted');
+        if(mode!=='solo'){
+          myPick = +el.dataset.n;
+          (votes[i] ||= {})[me] = myPick;
+          pub('vote', {who:me, i, pick:myPick});
+          paintTally();
+        }
       };
     });
+    if(mode==='guest'){
+      const m = document.createElement('div');
+      m.className = 'guestmsg';
+      m.textContent = '답을 고르면 바로 반영됩니다. 화면은 진행자를 따라 넘어가요.';
+      stage.appendChild(m);
+    }
+    paintTally();
   }
   document.getElementById('count').textContent =
     i===0 ? '표지' : (i===TOTAL-1 ? '정리' : `${i} / ${Q.length}`);
@@ -472,7 +625,7 @@ function render(){
   window.scrollTo(0,0);
 }
 
-function reveal(){
+function reveal(fromNet){
   if(i===0 || i===TOTAL-1 || shown) return;
   shown = true;
   const q = Q[i-1];
@@ -481,26 +634,34 @@ function reveal(){
     el.classList.add(n===q.ans ? 'right' : 'wrong');
   });
   document.getElementById('rev').classList.add('on');
+  paintTally();
+  if(mode==='host' && !fromNet) pub('state', {i, shown:true});
 }
 
 function go(n){
   i = Math.max(0, Math.min(TOTAL-1, n));
-  history.replaceState(null,'', i?('#'+i):'#');
+  myPick = null;
+  if(mode==='solo') history.replaceState(null,'', i?('#'+i):'#');
   render();
+  if(mode==='host') pub('state', {i, shown:false});
 }
-function next(){ if(!shown && i>0 && i<TOTAL-1) reveal(); else go(i+1); }
+function next(){
+  if(mode==='guest') return;           /* 화면 이동은 진행자만 */
+  if(!shown && i>0 && i<TOTAL-1) reveal(); else go(i+1);
+}
 
 document.getElementById('next').onclick = next;
-document.getElementById('prev').onclick = ()=>go(i-1);
+document.getElementById('prev').onclick = ()=>{ if(mode!=='guest') go(i-1); };
 document.getElementById('noteBtn').onclick = ()=>{
   notes = !notes;
   const n = document.getElementById('note');
   if(n) n.classList.toggle('on', notes);
 };
 document.addEventListener('keydown', e=>{
+  if(e.target.tagName==='INPUT') return;
   if(e.key==='ArrowRight') { next(); e.preventDefault(); }
-  else if(e.key==='ArrowLeft') go(i-1);
-  else if(e.key===' ') { reveal(); e.preventDefault(); }
+  else if(e.key==='ArrowLeft') { if(mode!=='guest') go(i-1); }
+  else if(e.key===' ') { if(mode!=='guest') reveal(); e.preventDefault(); }
   else if(e.key==='n'||e.key==='N') document.getElementById('noteBtn').click();
 });
 
